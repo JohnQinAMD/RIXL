@@ -23,7 +23,13 @@ ucx_hip_src = hipify_src.process('ucx_backend.cpp', extra_args: '-o')
 
 ucx_backend_includes = include_directories('.')
 
+dl_dep = dependency('dl', required: false)
+if not dl_dep.found()
+    dl_dep = meson.get_compiler('cpp').find_library('dl', required: true)
+endif
+
 ucx_backend_sources = ['config.cpp',
+                       'dram_staging.cpp',
                        'mem_list.cpp',
                        'rkey.cpp',
                        ucx_hip_src,
@@ -32,6 +38,7 @@ ucx_backend_sources = ['config.cpp',
 
 ucx_backend_dependencies = [asio_dep,
                             cuda_dep,
+                            dl_dep,
                             nixl_common_dep,
                             nixl_infra,
                             serdes_interface,

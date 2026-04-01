@@ -24,6 +24,7 @@
 #include <limits>
 #include <future>
 #include <set>
+#include <cstring>
 #include <string.h>
 #include <unistd.h>
 #include "absl/strings/numbers.h"
@@ -62,6 +63,15 @@ private:
     };
     std::optional<Notif> notif;
 
+    // DRAM staging: pending H2D copies for READ operations
+    struct StagingReadEntry {
+        void  *gpu_addr;
+        void  *host_addr;
+        size_t len;
+    };
+    std::vector<StagingReadEntry> stagingReads_;
+    DramStagingManager *dramStaging_ = nullptr;
+
     nixl_status_t
     checkConnection(nixl_status_t status = NIXL_SUCCESS) const {
         NIXL_ASSERT(!connections_.empty());
@@ -82,6 +92,31 @@ public:
     auto &
     notification() {
         return notif;
+    }
+
+    void
+    setDramStaging(DramStagingManager *mgr) {
+        dramStaging_ = mgr;
+    }
+
+    void
+    addStagingRead(void *gpu_addr, void *host_addr, size_t len) {
+        stagingReads_.push_back({gpu_addr, host_addr, len});
+    }
+
+    void
+    completeStagingReads() {
+        if (stagingReads_.empty() || !dramStaging_) return;
+        for (auto &e : stagingReads_) {
+            dramStaging_->copyH2D(e.gpu_addr, e.host_addr, e.len);
+        }
+        dramStaging_->sync();
+        stagingReads_.clear();
+    }
+
+    bool
+    hasStagingReads() const {
+        return !stagingReads_.empty();
     }
 
     void
@@ -866,6 +901,13 @@ nixlUcxEngine::nixlUcxEngine(const nixlBackendInitParams &init_params)
     auto &uw = uws.front();
     workerAddr = uw->epAddr();
     uw->regAmCallback(NOTIF_STR, notifAmCb, this);
+
+    dramStaging_ = std::make_unique<DramStagingManager>();
+    dramStagingEnabled_ = nixl_b_params_get(custom_params, "dram_staging", 0) != 0;
+    if (dramStaging_->isAvailable()) {
+        NIXL_INFO << "UCX engine: DRAM staging available"
+                  << (dramStagingEnabled_ ? " (force-enabled)" : " (auto on VRAM failure)");
+    }
 }
 
 nixl_mem_list_t nixlUcxEngine::getSupportedMems () const {
@@ -961,16 +1003,44 @@ nixl_status_t nixlUcxEngine::registerMem (const nixlBlobDesc &mem,
 {
     auto priv = std::make_unique<nixlUcxPrivateMetadata>();
 
-    // TODO: Add nixl_mem check?
-    const int ret = uc->memReg((void*) mem.addr, mem.len, priv->mem, nixl_mem);
-    if (ret) {
-        return NIXL_ERR_BACKEND;
-    }
-    priv->rkeyStr = uc->packRkey(priv->mem);
+    int ret = uc->memReg((void*) mem.addr, mem.len, priv->mem, nixl_mem);
 
-    if (priv->rkeyStr.empty()) {
+    if (ret && nixl_mem == VRAM_SEG &&
+        dramStaging_ && dramStaging_->isAvailable()) {
+        NIXL_INFO << "DRAM staging: VRAM registration failed, "
+                  << "falling back to pinned DRAM for 0x" << std::hex
+                  << mem.addr << std::dec << " (" << mem.len << " bytes)";
+        void *host_buf = dramStaging_->allocPinned(mem.len);
+        if (!host_buf) {
+            NIXL_ERROR << "DRAM staging: pinned alloc failed for "
+                       << mem.len << " bytes";
+            return NIXL_ERR_BACKEND;
+        }
+
+        ret = uc->memReg(host_buf, mem.len, priv->mem, DRAM_SEG);
+        if (ret) {
+            NIXL_ERROR << "DRAM staging: DRAM registration also failed";
+            dramStaging_->freePinned(host_buf);
+            return NIXL_ERR_BACKEND;
+        }
+
+        priv->staging_ = StagingInfo{(void *)mem.addr, host_buf, mem.len};
+        NIXL_INFO << "DRAM staging: GPU 0x" << std::hex << mem.addr
+                  << " -> host 0x" << (uintptr_t)host_buf << std::dec
+                  << " (" << mem.len / (1024 * 1024) << " MB)";
+    } else if (ret) {
         return NIXL_ERR_BACKEND;
     }
+
+    priv->rkeyStr = uc->packRkey(priv->mem);
+    if (priv->rkeyStr.empty()) {
+        if (priv->staging_) {
+            uc->memDereg(priv->mem);
+            dramStaging_->freePinned(priv->staging_->host_addr);
+        }
+        return NIXL_ERR_BACKEND;
+    }
+
     out = priv.release();
     return NIXL_SUCCESS;
 }
@@ -979,6 +1049,9 @@ nixl_status_t nixlUcxEngine::deregisterMem (nixlBackendMD* meta)
 {
     nixlUcxPrivateMetadata *priv = (nixlUcxPrivateMetadata*) meta;
     uc->memDereg(priv->mem);
+    if (priv->hasStaging() && dramStaging_) {
+        dramStaging_->freePinned(priv->getStaging().host_addr);
+    }
     delete priv;
     return NIXL_SUCCESS;
 }
@@ -986,12 +1059,22 @@ nixl_status_t nixlUcxEngine::deregisterMem (nixlBackendMD* meta)
 nixl_status_t nixlUcxEngine::getPublicData (const nixlBackendMD* meta,
                                             std::string &str) const {
     const nixlUcxPrivateMetadata *priv = (nixlUcxPrivateMetadata*) meta;
-    str = priv->get();
+    if (priv->hasStaging()) {
+        const auto &si = priv->getStaging();
+        StagingWireHeader hdr;
+        hdr.magic = StagingWireHeader::MAGIC;
+        hdr.gpu_base = (uint64_t)(uintptr_t)si.gpu_addr;
+        hdr.host_base = (uint64_t)(uintptr_t)si.host_addr;
+        hdr.region_size = si.size;
+        str = std::string(reinterpret_cast<const char *>(&hdr), sizeof(hdr))
+            + priv->get();
+    } else {
+        str = priv->get();
+    }
     return NIXL_SUCCESS;
 }
 
 
-// To be cleaned up
 nixl_status_t
 nixlUcxEngine::internalMDHelper (const nixl_blob_t &blob,
                                  const std::string &agent,
@@ -1003,7 +1086,6 @@ nixlUcxEngine::internalMDHelper (const nixl_blob_t &blob,
         auto search = remoteConnMap.find(agent);
 
         if (search == remoteConnMap.end()) {
-            // TODO: err: remote connection not found
             return NIXL_ERR_NOT_FOUND;
         }
         md->conn = search->second;
@@ -1011,8 +1093,29 @@ nixlUcxEngine::internalMDHelper (const nixl_blob_t &blob,
         std::vector<char> addr(size);
         nixlSerDes::_stringToBytes(addr.data(), blob, size);
 
+        const char *rkey_data = addr.data();
+        size_t rkey_size = size;
+
+        if (rkey_size >= sizeof(StagingWireHeader)) {
+            StagingWireHeader hdr;
+            std::memcpy(&hdr, rkey_data, sizeof(hdr));
+            if (hdr.magic == StagingWireHeader::MAGIC) {
+                md->staging_ = StagingInfo{
+                    reinterpret_cast<void *>(static_cast<uintptr_t>(hdr.gpu_base)),
+                    reinterpret_cast<void *>(static_cast<uintptr_t>(hdr.host_base)),
+                    static_cast<size_t>(hdr.region_size)
+                };
+                rkey_data += sizeof(StagingWireHeader);
+                rkey_size -= sizeof(StagingWireHeader);
+                NIXL_DEBUG << "DRAM staging: remote metadata has staging "
+                           << "gpu=0x" << std::hex << hdr.gpu_base
+                           << " host=0x" << hdr.host_base
+                           << " size=" << std::dec << hdr.region_size;
+            }
+        }
+
         for (size_t wid = 0; wid < uws.size(); wid++) {
-            md->addRkey(*md->conn->getEp(wid), addr.data());
+            md->addRkey(*md->conn->getEp(wid), rkey_data);
         }
 
         output = (nixlBackendMD *)md.release();
@@ -1030,7 +1133,20 @@ nixlUcxEngine::loadLocalMD (nixlBackendMD* input,
                             nixlBackendMD* &output)
 {
     nixlUcxPrivateMetadata* input_md = (nixlUcxPrivateMetadata*) input;
-    return internalMDHelper(input_md->rkeyStr, localAgent, output);
+    std::string blob;
+    if (input_md->hasStaging()) {
+        const auto &si = input_md->getStaging();
+        StagingWireHeader hdr;
+        hdr.magic = StagingWireHeader::MAGIC;
+        hdr.gpu_base = (uint64_t)(uintptr_t)si.gpu_addr;
+        hdr.host_base = (uint64_t)(uintptr_t)si.host_addr;
+        hdr.region_size = si.size;
+        blob = std::string(reinterpret_cast<const char *>(&hdr), sizeof(hdr))
+             + input_md->get();
+    } else {
+        blob = input_md->get();
+    }
+    return internalMDHelper(blob, localAgent, output);
 }
 
 // To be cleaned up
@@ -1182,8 +1298,11 @@ nixlUcxEngine::sendXferRangeBatch(nixlUcxEp &ep,
                                   const nixl_meta_dlist_t &remote,
                                   size_t worker_id,
                                   size_t start_idx,
-                                  size_t end_idx) {
+                                  size_t end_idx,
+                                  DramStagingManager *staging,
+                                  nixlBackendReqH *handle) {
     batchResult result = {NIXL_SUCCESS, 0, nullptr};
+    auto *ucxHandle = static_cast<nixlUcxBackendH *>(handle);
 
     for (size_t i = start_idx; i < end_idx; ++i) {
         void *laddr = (void *)local[i].addr;
@@ -1196,6 +1315,37 @@ nixlUcxEngine::sendXferRangeBatch(nixlUcxEp &ep,
         auto &rmd_ep = rmd->conn->getEp(worker_id);
         if (__builtin_expect(rmd_ep.get() != &ep, 0)) {
             break;
+        }
+
+        /* Translate LOCAL address: GPU → DRAM staging */
+        if (lmd->hasStaging() && staging) {
+            const auto &si = lmd->getStaging();
+            uintptr_t la = (uintptr_t)laddr;
+            uintptr_t ga = (uintptr_t)si.gpu_addr;
+
+            if (la >= ga && la < ga + si.size) {
+                size_t offset = la - ga;
+                void *staged = (char *)si.host_addr + offset;
+
+                if (operation == NIXL_WRITE) {
+                    staging->copyD2H(staged, laddr, lsize);
+                    staging->sync();
+                } else if (operation == NIXL_READ && ucxHandle) {
+                    ucxHandle->addStagingRead(laddr, staged, lsize);
+                }
+                laddr = staged;
+            }
+        }
+
+        /* Translate REMOTE address: GPU → DRAM staging on the remote side */
+        if (rmd->hasStaging()) {
+            const auto &rsi = rmd->getStaging();
+            uintptr_t ra = raddr;
+            uintptr_t rga = (uintptr_t)rsi.gpu_addr;
+
+            if (ra >= rga && ra < rga + rsi.size) {
+                raddr = (uintptr_t)rsi.host_addr + (ra - rga);
+            }
         }
 
         ++result.size;
@@ -1245,11 +1395,17 @@ nixlUcxEngine::sendXferRange(const nixl_xfer_op_t &operation,
      * one flush request, and one notification request */
     intHandle->reserve(3);
 
+    if (dramStaging_ && dramStaging_->isAvailable()) {
+        intHandle->setDramStaging(dramStaging_.get());
+    }
+
     for (size_t i = start_idx; i < end_idx;) {
         /* Send requests to a single EP */
         auto rmd = static_cast<nixlUcxPublicMetadata *>(remote[i].metadataP);
         auto &ep = rmd->conn->getEp(workerId);
-        auto result = sendXferRangeBatch(*ep, operation, local, remote, workerId, i, end_idx);
+        auto result = sendXferRangeBatch(*ep, operation, local, remote, workerId,
+                                         i, end_idx,
+                                         dramStaging_.get(), handle);
 
         /* Append a single pending request for the entire EP batch */
         ret = intHandle->append(result.status, result.req, rmd->conn);
@@ -1295,14 +1451,16 @@ nixlUcxEngine::postXfer(const nixl_xfer_op_t &operation,
         return NIXL_ERR_INVALID_PARAM;
     }
 
-    // TODO: assert that handle is empty/completed, as we can't post request before completion
-
     ret = sendXferRange(operation, local, remote, remote_agent, handle, 0, lcnt);
     if (ret != NIXL_SUCCESS) {
         return ret;
     }
 
     ret = int_handle->status();
+
+    if (ret == NIXL_SUCCESS && int_handle->hasStagingReads()) {
+        int_handle->completeStagingReads();
+    }
     if (opt_args && opt_args->hasNotif) {
         if (ret == NIXL_SUCCESS) {
             nixlUcxReq req;
@@ -1329,6 +1487,10 @@ nixl_status_t nixlUcxEngine::checkXfer (nixlBackendReqH* handle) const
     nixlUcxBackendH *intHandle = (nixlUcxBackendH *)handle;
     auto& notif = intHandle->notification();
     nixl_status_t handle_status = intHandle->status();
+
+    if (handle_status == NIXL_SUCCESS && intHandle->hasStagingReads()) {
+        intHandle->completeStagingReads();
+    }
 
     if ((handle_status != NIXL_SUCCESS) || !notif.has_value()) {
         if (handle_status != NIXL_IN_PROG) { // error flow

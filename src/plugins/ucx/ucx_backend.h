@@ -34,6 +34,7 @@
 
 // Local includes
 #include "common/nixl_time.h"
+#include "dram_staging.h"
 #include "mem_list.h"
 #include "rkey.h"
 #include "ucx_utils.h"
@@ -60,6 +61,7 @@ class nixlUcxPrivateMetadata : public nixlBackendMD {
     private:
         nixlUcxMem mem;
         nixl_blob_t rkeyStr;
+        std::optional<StagingInfo> staging_;
 
     public:
         nixlUcxPrivateMetadata() : nixlBackendMD(true) {
@@ -72,6 +74,16 @@ class nixlUcxPrivateMetadata : public nixlBackendMD {
         [[nodiscard]] const nixlUcxMem &
         getMem() const noexcept {
             return mem;
+        }
+
+        [[nodiscard]] bool
+        hasStaging() const noexcept {
+            return staging_.has_value();
+        }
+
+        [[nodiscard]] const StagingInfo &
+        getStaging() const noexcept {
+            return *staging_;
         }
 
     friend class nixlUcxEngine;
@@ -92,10 +104,23 @@ public:
         rkeys_.emplace_back(std::make_unique<nixl::ucx::rkey>(ep, rkey_buffer));
     }
 
+    [[nodiscard]] bool
+    hasStaging() const noexcept {
+        return staging_.has_value();
+    }
+
+    [[nodiscard]] const StagingInfo &
+    getStaging() const noexcept {
+        return *staging_;
+    }
+
     ucx_connection_ptr_t conn;
 
 private:
     std::vector<std::unique_ptr<nixl::ucx::rkey>> rkeys_;
+    std::optional<StagingInfo> staging_;
+
+    friend class nixlUcxEngine;
 };
 
 class nixlUcxEngine : public nixlBackendEngine {
@@ -282,7 +307,9 @@ private:
                        const nixl_meta_dlist_t &remote,
                        size_t worker_id,
                        size_t start_idx,
-                       size_t end_idx);
+                       size_t end_idx,
+                       DramStagingManager *staging = nullptr,
+                       nixlBackendReqH *handle = nullptr);
 
     /**
      * Get the worker ID from the optional arguments.
@@ -298,6 +325,10 @@ private:
     mutable std::atomic<size_t> sharedWorkerIndex_;
 
     const bool progressThreadEnabled_;
+
+    /* DRAM staging for NICs without GPU Direct RDMA (e.g. ionic) */
+    std::unique_ptr<DramStagingManager> dramStaging_;
+    bool dramStagingEnabled_ = false;
 
     /* Notifications */
     notif_list_t notifMainList;
